@@ -1,0 +1,272 @@
+# Common (multistage) args
+# D_OS is the install.pl distro name (--distro): SLES 16 GA is "sles16sp0". Do not pass
+# "sles16.0" — install.pl rewrites dots to 'u' (sles16u0) and its sles16sp0 checks miss it.
+ARG D_OS="sles16sp0"
+ARG D_ARCH="x86_64"
+ARG D_CONTAINER_VER="0"
+# DOCA publishes sles16 repos/sources from 3.3.0; 3.5.0 matches the vendored install.pl in
+# vendor/mlnx_ofed (OFED-internal-26.07-0.7.7).
+ARG D_DOCA_VERSION="3.5.0"
+ARG D_OFED_VERSION="26.07-0.7.7.0"
+# Empty means "build against the kernel the base image ships" (SLE 16 = 160000 series,
+# Linux 6.12). Set it only to pin another kernel that is installable from the repos.
+ARG D_KERNEL_VER=""
+ARG D_OFED_SRC_DOWNLOAD_PATH="/run/mellanox/src"
+ARG OFED_SRC_LOCAL_DIR=${D_OFED_SRC_DOWNLOAD_PATH}/MLNX_OFED_SRC-${D_OFED_VERSION}
+ARG D_ENABLE_DKMS=false
+
+# Common for build and final clean image of precompiled driver container.
+# The SLE 16 kernel-module-devel BCI ships kernel-default-devel, gcc, make, rpm-build, perl,
+# binutils and dwarves, so the driver builds against the image's own kernel with no repo pin.
+ARG D_BASE_IMAGE="registry.suse.com/bci/bci-sle16-kernel-module-devel:16.0"
+
+# openSUSE Backports names SLE 16 repos with dot notation (SLE-16.0), never SLE-16-SP0.
+ARG D_SLE_BACKPORTS="SLE-16.0"
+
+##################################################################
+# Stage: build go binary for entrypoint
+FROM golang:1.26 AS go_builder
+
+# Set GOPROXY if provided
+ARG GOPROXY
+ENV GOPROXY=$GOPROXY
+
+WORKDIR /workspace
+
+COPY entrypoint/go.mod go.mod
+COPY entrypoint/go.sum go.sum
+
+RUN go mod download
+
+COPY entrypoint/ .
+
+RUN TARGETARCH=${D_ARCH} TARGETOS=linux make build
+
+##################################################################
+# Stage: Minimal base image update and install common requirements
+FROM $D_BASE_IMAGE AS base
+
+ARG D_OFED_VERSION
+ARG D_CONTAINER_VER
+ARG D_OFED_SRC_DOWNLOAD_PATH
+
+ENV NVIDIA_NIC_DRIVER_VER=${D_OFED_VERSION}
+ENV NVIDIA_NIC_CONTAINER_VER=${D_CONTAINER_VER}
+
+WORKDIR /root
+
+RUN set -x && \
+# Perform distro update and install prerequirements
+    zypper --gpg-auto-import-keys ref -s && \
+    zypper --non-interactive update && \
+    zypper --non-interactive install --no-recommends \
+# Driver build / install script requirements
+    perl pciutils kmod lsof python3 \
+# dh-python not found
+# Container functional requirements
+    jq iproute2 udev ethtool awk procps \
+# NFS userspace tools (mount.nfs) — copied to host at runtime when ENABLE_NFSRDMA=true
+    nfs-client
+
+# Kernel to build and install modules against: the requested one, else the one the base image
+# ships. Kept in a file because an ARG cannot be mutated across RUNs and stages.
+ARG D_KERNEL_VER
+RUN kver=$(ls -1 /lib/modules | grep -- -default$ | sort -V | tail -1) && \
+    if [ -n "$D_KERNEL_VER" ]; then echo "$D_KERNEL_VER"; else echo "$kver"; fi > /root/kver && \
+    test -d "/lib/modules/$(cat /root/kver)" && \
+    cat /root/kver
+
+COPY --from=go_builder /workspace/build/entrypoint /root/entrypoint
+WORKDIR /root
+ADD ./entrypoint.sh /root/entrypoint.sh
+ADD ./loader.sh /root/loader.sh
+
+ENTRYPOINT ["/root/loader.sh"]
+
+##############################################################################################
+# Stage: Download NVIDIA driver sources and install src driver container packages requirements
+
+FROM base AS driver-src
+
+# Inherited global args
+ARG D_OS
+ARG D_DOCA_VERSION
+ARG D_OFED_VERSION
+ARG D_OFED_SRC_DOWNLOAD_PATH
+ARG D_SLE_BACKPORTS
+
+# Stage args
+ARG D_OFED_BASE_URL="https://linux.mellanox.com/public/repo/doca/${D_DOCA_VERSION}/SOURCES/mlnx_ofed"
+ARG D_OFED_SRC_TYPE=""
+
+# Up to DOCA 3.5 the sources ship as MLNX_OFED_SRC-<ofed-version>.tgz, which bundles
+# install.pl; from 3.6 on they ship as DOCA_BASE_SRC-<doca-version>-<build-number>.tar.gz
+# with no installer. This default composes the legacy name because the 3.6 build number cannot
+# be derived from D_DOCA_VERSION, so 3.6+ callers must pass the exact archive name or path via
+# D_OFED_URL_PATH. Both layouts are detected and handled below.
+ARG D_OFED_SRC_ARCHIVE="MLNX_OFED_SRC-${D_OFED_SRC_TYPE}${D_OFED_VERSION}.tgz"
+ARG D_OFED_URL_PATH="${D_OFED_BASE_URL}/${D_OFED_SRC_ARCHIVE}"  # although argument name says URL, local compressed archives may also be used (intended for internal use)
+
+ENV NVIDIA_NIC_DRIVER_PATH="${D_OFED_SRC_DOWNLOAD_PATH}/MLNX_OFED_SRC-${D_OFED_VERSION}"
+
+WORKDIR /root
+
+# DKMS is always installed in the dynamic (sources) flow - install.pl runs at container
+# runtime and may build DKMS-enabled packages. DKMS is not in default SLES repos, so it's
+# fetched from openSUSE Backports.
+RUN set -x && \
+    for source in ${D_ZYPPER_REMOVE}; do rm -f /etc/zypp/repos.d/${source}.repo; done && \
+# Perform distro update and install prerequirements
+    zypper --gpg-auto-import-keys ref -s && \
+    zypper --non-interactive update && \
+    zypper --non-interactive install --no-recommends \
+    make autoconf chrpath automake hostname gcc quilt dracut rpm-build sysvinit-tools && \
+    zypper --gpg-auto-import-keys addrepo \
+        https://download.opensuse.org/repositories/openSUSE:Backports:${D_SLE_BACKPORTS}/standard/openSUSE:Backports:${D_SLE_BACKPORTS}.repo && \
+    zypper --gpg-auto-import-keys ref && \
+    zypper --gpg-auto-import-keys --non-interactive install --no-recommends dkms && \
+    if [ -f /etc/modprobe.d/10-unsupported-modules.conf ]; then \
+        sed -i 's/allow_unsupported_modules 0/allow_unsupported_modules 1/' /etc/modprobe.d/10-unsupported-modules.conf; \
+    else \
+        echo 'allow_unsupported_modules 1' > /etc/modprobe.d/10-unsupported-modules.conf; \
+    fi
+
+# Download NVIDIA NIC driver
+RUN mkdir -p ${D_OFED_SRC_DOWNLOAD_PATH}
+WORKDIR ${D_OFED_SRC_DOWNLOAD_PATH}
+# Fixed destination name: ADD unpacks a local archive into a directory of this name, and
+# writes a plain file of this name when fetching a URL. The archive's own top-level
+# directory is discovered afterwards, so its exact version is not needed here.
+ADD ${D_OFED_URL_PATH} doca_base_src
+
+# Up to DOCA 3.5 the archive extracts to MLNX_OFED_SRC-<ofed-version>/ complete with
+# install.pl, landing directly at NVIDIA_NIC_DRIVER_PATH with no further work needed.
+# DOCA 3.6 deprecated install.pl and ships a flat DOCA_BASE_SRC-* directory of SRPMs
+# instead, so that layout is reshaped into the tree the build expects and the vendored
+# scripts are staged into it. See vendor/mlnx_ofed/README.md.
+COPY vendor/mlnx_ofed /opt/mlnx_ofed
+RUN set -eux && \
+    if [ -d doca_base_src ]; then \
+        mv doca_base_src/* . && rmdir doca_base_src; \
+    else \
+        tar -xzf doca_base_src && rm -f doca_base_src; \
+    fi && \
+    src_dir=$(find . -maxdepth 1 -type d -name 'DOCA_BASE_SRC-*' | head -1) && \
+    if [ -n "${src_dir}" ]; then \
+        /opt/mlnx_ofed/stage_src_tree.sh "${src_dir}" "${NVIDIA_NIC_DRIVER_PATH}" rpm; \
+    elif [ -f "${NVIDIA_NIC_DRIVER_PATH}/install.pl" ]; then \
+        echo "Using legacy source tree with bundled install.pl: ${NVIDIA_NIC_DRIVER_PATH}"; \
+    else \
+        echo "error: ${D_OFED_URL_PATH} yielded neither a DOCA_BASE_SRC-* directory nor ${NVIDIA_NIC_DRIVER_PATH}/install.pl" >&2; \
+        exit 1; \
+    fi
+
+WORKDIR /root
+
+CMD ["sources"]
+
+LABEL doca-version=${D_DOCA_VERSION}
+LABEL ofed-version=${D_OFED_VERSION}
+
+#####################
+# Stage: Build driver
+
+FROM driver-src AS driver-builder
+
+# Inherited global args
+ARG D_OS
+ARG OFED_SRC_LOCAL_DIR
+ARG D_ENABLE_DKMS
+
+# The base image already carries the toolchain (gcc, make, rpm-build) and the kernel sources
+# for its own kernel, so only an explicitly pinned D_KERNEL_VER still needs a devel install.
+RUN set -x && \
+    KVER=$(cat /root/kver) && \
+    ls -l /lib/modules && \
+    [ -d "/lib/modules/${KVER}/build" ] || \
+        zypper --non-interactive install --no-recommends kernel-default-devel="${KVER%-default}"
+
+# Build driver --distro ${D_OS}
+# When D_ENABLE_DKMS=true, install.pl creates DKMS-enabled RPMs (source in /usr/src/, dkms.conf)
+# When D_ENABLE_DKMS=false, install.pl creates static kernel modules (--without-dkms)
+# Only the exact string "true" enables DKMS; reject other values so they cannot produce
+# non-DKMS packages while the runtime bool parser treats them as enabled.
+RUN set -x && \
+    KVER=$(cat /root/kver) && \
+    case "$D_ENABLE_DKMS" in \
+        true|false) ;; \
+        *) echo "error: D_ENABLE_DKMS must be exactly 'true' or 'false', got '$D_ENABLE_DKMS'" >&2; exit 1 ;; \
+    esac && \
+    if [ "$D_ENABLE_DKMS" = "true" ]; then \
+        ${OFED_SRC_LOCAL_DIR}/install.pl -vvv --distro ${D_OS} --kernel-sources /lib/modules/${KVER}/build --without-depcheck --kernel ${KVER} --kernel-only --build-only --copy-ifnames-udev --with-mlnx-tools --without-knem-modules --without-srp-modules --without-kernel-mft-modules --without-iser-modules --without-isert-modules --without-xpmem --without-xpmem-modules --without-xpmem-dkms; \
+    else \
+        ${OFED_SRC_LOCAL_DIR}/install.pl -vvv --distro ${D_OS} --kernel-sources /lib/modules/${KVER}/build --without-depcheck --kernel ${KVER} --kernel-only --build-only --copy-ifnames-udev --with-mlnx-tools --without-knem-modules --without-srp-modules --without-kernel-mft-modules --without-iser-modules --without-isert-modules --without-xpmem --without-xpmem-modules --without-dkms; \
+    fi
+RUN ls -l ${OFED_SRC_LOCAL_DIR}/RPMS/*/x86_64/
+###################################
+# Stage: Install precompiled driver
+
+FROM base AS precompiled
+
+# Inherited global args
+ARG D_OS
+ARG D_ARCH
+ARG D_OFED_VERSION
+ARG D_CONTAINER_VER
+ARG OFED_SRC_LOCAL_DIR
+ARG D_ENABLE_DKMS
+ARG D_SLE_BACKPORTS
+
+ENV NVIDIA_NIC_DRIVER_VER=${D_OFED_VERSION}
+ENV NVIDIA_NIC_DRIVER_PATH=""
+ENV NVIDIA_NIC_CONTAINER_VER=${D_CONTAINER_VER}
+# Canonical true/false matching install.pl ([ "$D_ENABLE_DKMS" = "true" ]).
+# Reject TRUE/1/yes so Go cannot parse them as enabled against non-DKMS packages.
+RUN case "$D_ENABLE_DKMS" in \
+        true|false) ;; \
+        *) echo "error: D_ENABLE_DKMS must be exactly 'true' or 'false', got '$D_ENABLE_DKMS'" >&2; exit 1 ;; \
+    esac
+ENV NVIDIA_NIC_DRIVER_DKMS_ENABLED=${D_ENABLE_DKMS}
+
+ENV NVIDIA_NIC_DRIVER_PATH=""
+COPY --from=driver-builder ${OFED_SRC_LOCAL_DIR}/RPMS/sles-release-*/${D_ARCH}/*.rpm /root/
+
+WORKDIR /root/
+RUN set -x && \
+    rpm -ivh --nodeps \
+    ./mlnx-nfsrdma-*.rpm \
+    ./mlnx-nvme-*.rpm \
+    ./mlnx-ofa_kernel-*.rpm \
+    ./mlnx-tools-*.rpm
+
+RUN set -x && \
+    zypper --non-interactive install --no-recommends \
+    # MOFED functional requirements
+    make autoconf chrpath automake hostname gcc quilt dracut rpm-build sysvinit-tools \
+    # Container functional requirements
+    jq kmod procps && \
+# DKMS and kernel module build tools when DKMS enabled (runtime dkms add/build/install)
+    if [ "$D_ENABLE_DKMS" = "true" ]; then \
+        zypper --gpg-auto-import-keys addrepo \
+            https://download.opensuse.org/repositories/openSUSE:Backports:${D_SLE_BACKPORTS}/standard/openSUSE:Backports:${D_SLE_BACKPORTS}.repo && \
+        zypper --gpg-auto-import-keys ref && \
+        zypper --gpg-auto-import-keys --non-interactive install --no-recommends dkms && \
+        if [ -f /etc/modprobe.d/10-unsupported-modules.conf ]; then \
+            sed -i 's/allow_unsupported_modules 0/allow_unsupported_modules 1/' /etc/modprobe.d/10-unsupported-modules.conf; \
+        else \
+            echo 'allow_unsupported_modules 1' > /etc/modprobe.d/10-unsupported-modules.conf; \
+        fi; \
+    fi
+
+# Prevent modprobe from giving a WARNING about missing files
+RUN KVER=$(cat /root/kver) && \
+    touch /lib/modules/${KVER}/modules.order /lib/modules/${KVER}/modules.builtin && \
+# Introduce installed kernel modules
+    depmod ${KVER}
+
+WORKDIR /
+ADD ./entrypoint.sh /root/entrypoint.sh
+ADD ./dtk_nic_driver_build.sh /root/dtk_nic_driver_build.sh
+
+ENTRYPOINT ["/root/loader.sh"]
+CMD ["precompiled"]
