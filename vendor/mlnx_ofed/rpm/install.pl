@@ -940,7 +940,7 @@ if ($DISTRO =~ m/SLES12|SLES15|SLES16|openSUSE15/) {
     $libudev_devel = "";
 }
 
-if ($rpm_distro =~ m/sles15sp[4-7]|sles16sp0/) {
+if ($rpm_distro =~ m/sles15sp[4-7]|sles16sp[0-9]/) {
     $libudev_devel = "systemd-devel";
     $python_rpm_macros = "python-rpm-macros";
 }
@@ -5204,7 +5204,7 @@ sub build_kernel_rpm
 
     print_and_log("Running $cmd\n", $verbose);
     system("echo $cmd > $ofedlogs/$name-$ver.rpmbuild.log 2>&1");
-    system("$cmd >> $ofedlogs/$name-$ver.rpmbuild.log 2>&1");
+    if ($verbose2) { system("$cmd 2>&1 | tee -a $ofedlogs/$name-$ver.rpmbuild.log"); } else { system("$cmd >> $ofedlogs/$name-$ver.rpmbuild.log 2>&1"); }
     $res = $? >> 8;
     $sig = $? & 127;
     if ($sig or $res) {
@@ -5668,7 +5668,7 @@ sub build_rpm
         open(LOG, "+>$ofedlogs/$parent-$ver.rpmbuild.log");
         print LOG "Running $cmd\n";
         close LOG;
-        system("$cmd >> $ofedlogs/$parent-$ver.rpmbuild.log 2>&1");
+        if ($verbose2) { system("$cmd 2>&1 | tee -a $ofedlogs/$parent-$ver.rpmbuild.log"); } else { system("$cmd >> $ofedlogs/$parent-$ver.rpmbuild.log 2>&1"); }
         $res = $? >> 8;
         $sig = $? & 127;
         if ($sig or $res) {

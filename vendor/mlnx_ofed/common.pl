@@ -349,7 +349,7 @@ sub parse_rpm_dist($$) {
 	} elsif ($dist_rpm =~ /openSUSE-release-15.3/) {
                 $DISTRO = "openSUSE15.3";
                 $rpm_distro = "opensuse15sp3";
-	} elsif ($dist_rpm =~ /(?:sles|SLES|SLE_HPC|SLES_SAP)-release-(1[\d])(|\.([\d]))-/) {
+	} elsif ($dist_rpm =~ /(?:sles|SLES|SLE_HPC|SLES_SAP|SLES_NVIDIA)-release-(1[\d])(|\.([\d]))-/) {
 		# example: dist_rpm: "sles-release-15.1-39.1"
 		#					"sles-release-12-1.377"
 		my $sp = $2? $3 : "0";

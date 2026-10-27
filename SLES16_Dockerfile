@@ -1,7 +1,7 @@
 # Common (multistage) args
-# D_OS is the install.pl distro name (--distro): SLES 16 GA is "sles16sp0". Do not pass
+# D_OS is the install.pl distro name (--distro): SLES 16.1 is "sles16sp1" (SLES 16 GA was "sles16sp0"). Do not pass
 # "sles16.0" — install.pl rewrites dots to 'u' (sles16u0) and its sles16sp0 checks miss it.
-ARG D_OS="sles16sp0"
+ARG D_OS="sles16sp1"
 ARG D_ARCH="x86_64"
 ARG D_CONTAINER_VER="0"
 # DOCA publishes sles16 repos/sources from 3.3.0; 3.5.0 matches the vendored install.pl in
@@ -17,7 +17,7 @@ ARG OFED_SRC_LOCAL_DIR=${D_OFED_SRC_DOWNLOAD_PATH}/MLNX_OFED_SRC-${D_OFED_VERSIO
 # Common for build and final clean image of precompiled driver container.
 # The SLE 16 kernel-module-devel BCI ships kernel-default-devel, gcc, make, rpm-build, perl,
 # binutils and dwarves, so the driver builds against the image's own kernel with no repo pin.
-ARG D_BASE_IMAGE="registry.suse.com/bci/bci-sle16-kernel-module-devel:16.0"
+ARG D_BASE_IMAGE="registry.suse.com/bci/bci-sle16-kernel-module-devel:16.1"
 
 ##################################################################
 # Stage: build go binary for entrypoint
@@ -69,7 +69,6 @@ RUN set -x && \
 ARG D_KERNEL_VER
 RUN kver=$(ls -1 /lib/modules | grep -- -default$ | sort -V | tail -1) && \
     if [ -n "$D_KERNEL_VER" ]; then echo "$D_KERNEL_VER"; else echo "$kver"; fi > /root/kver && \
-    test -d "/lib/modules/$(cat /root/kver)" && \
     cat /root/kver
 
 COPY --from=go_builder /workspace/build/entrypoint /root/entrypoint
@@ -148,7 +147,8 @@ RUN set -eux && \
     if [ -n "${src_dir}" ]; then \
         /opt/mlnx_ofed/stage_src_tree.sh "${src_dir}" "${NVIDIA_NIC_DRIVER_PATH}" rpm; \
     elif [ -f "${NVIDIA_NIC_DRIVER_PATH}/install.pl" ]; then \
-        echo "Using legacy source tree with bundled install.pl: ${NVIDIA_NIC_DRIVER_PATH}"; \
+        echo "Using legacy source tree: updating install.pl and common.pl from /opt/mlnx_ofed: ${NVIDIA_NIC_DRIVER_PATH}"; \
+        cp -f /opt/mlnx_ofed/rpm/install.pl /opt/mlnx_ofed/common.pl "${NVIDIA_NIC_DRIVER_PATH}/"; \
     else \
         echo "error: ${D_OFED_URL_PATH} yielded neither a DOCA_BASE_SRC-* directory nor ${NVIDIA_NIC_DRIVER_PATH}/install.pl" >&2; \
         exit 1; \
@@ -169,21 +169,26 @@ FROM driver-src AS driver-builder
 # Inherited global args
 ARG D_OS
 ARG OFED_SRC_LOCAL_DIR
+ARG D_ARCH
 
 # The base image already carries the toolchain (gcc, make, rpm-build) and the kernel sources
 # for its own kernel, so only an explicitly pinned D_KERNEL_VER still needs a devel install.
 RUN set -x && \
     KVER=$(cat /root/kver) && \
     ls -l /lib/modules && \
-    [ -d "/lib/modules/${KVER}/build" ] || \
-        zypper --non-interactive install --no-recommends kernel-default-devel="${KVER%-default}"
+    if [ ! -d "/lib/modules/${KVER}/build" ]; then \
+        flavor="${KVER##*-}" && \
+        zypper --non-interactive install --no-recommends "kernel-${flavor}-devel" || \
+        zypper --non-interactive install --no-recommends "kernel-default-devel"; \
+    fi && \
+    test -d "/lib/modules/${KVER}/build"
 
 # Build driver --distro ${D_OS}. SLES16 always builds --without-dkms: dkms is not
 # available in SLE 16 BCI repos (its kernel-syms dependency is unsolvable there).
 RUN set -x && \
     KVER=$(cat /root/kver) && \
-    ${OFED_SRC_LOCAL_DIR}/install.pl -vvv --distro ${D_OS} --kernel-sources /lib/modules/${KVER}/build --without-depcheck --kernel ${KVER} --kernel-only --build-only --copy-ifnames-udev --with-mlnx-tools --without-knem-modules --without-srp-modules --without-kernel-mft-modules --without-iser-modules --without-isert-modules --without-xpmem --without-xpmem-modules --without-dkms
-RUN ls -l ${OFED_SRC_LOCAL_DIR}/RPMS/*/x86_64/
+    ${OFED_SRC_LOCAL_DIR}/install.pl -vvv --distro ${D_OS} --kernel-sources /lib/modules/${KVER}/build --without-depcheck --kernel ${KVER} --kernel-only --build-only --copy-ifnames-udev --with-mlnx-tools --without-knem --without-srp --without-kernel-mft --without-iser --without-isert --without-xpmem --without-xpmem-modules --without-mlnx-nvme --without-dkms
+RUN ls -l ${OFED_SRC_LOCAL_DIR}/RPMS/*/${D_ARCH}/
 ###################################
 # Stage: Install precompiled driver
 
@@ -211,11 +216,13 @@ COPY --from=driver-builder ${OFED_SRC_LOCAL_DIR}/RPMS/[sS]LES-release-*/${D_ARCH
 
 WORKDIR /root/
 RUN set -x && \
+    KVER=$(cat /root/kver) && \
+    flavor="${KVER##*-}" && \
     rpm -ivh --nodeps \
-    ./mlnx-nfsrdma-*.rpm \
-    ./mlnx-nvme-*.rpm \
-    ./mlnx-ofa_kernel-*.rpm \
-    ./mlnx-tools-*.rpm
+        ./mlnx-tools-*.rpm \
+        ./mlnx-ofa_kernel-[0-9]*.rpm \
+        ./mlnx-ofa_kernel-kmp-${flavor}-*.rpm \
+        ./kernel-mft-mlnx-kmp-${flavor}-*.rpm
 
 RUN set -x && \
     zypper --non-interactive install --no-recommends \
@@ -226,11 +233,12 @@ RUN set -x && \
 
 # Prevent modprobe from giving a WARNING about missing files
 RUN KVER=$(cat /root/kver) && \
+    mkdir -p /lib/modules/${KVER} && \
     touch /lib/modules/${KVER}/modules.order /lib/modules/${KVER}/modules.builtin && \
 # Introduce installed kernel modules
     depmod ${KVER}
 
-WORKDIR /
+WORKDIR /root
 ADD ./entrypoint.sh /root/entrypoint.sh
 ADD ./dtk_nic_driver_build.sh /root/dtk_nic_driver_build.sh
 
